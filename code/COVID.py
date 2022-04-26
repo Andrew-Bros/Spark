@@ -9,7 +9,7 @@
 # COMMAND ----------
 
 from pyspark.sql.types import *
-from pyspark.sql.functions import upper
+from pyspark.sql.functions import col, upper
 
 S3BUCKET = "s3://seng-5709-spark"
 
@@ -52,6 +52,23 @@ case_df.show(5, False)
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ### County population
+# MAGIC https://data.census.gov/cedsci/table?t=Population%20Total&g=0400000US27%240500000&tid=ACSDT5Y2020.B01003&tp=true
+# MAGIC 
+# MAGIC   - Extracted as Excel spreadsheet then saved as csv with just county, population
+
+# COMMAND ----------
+
+population_schema = StructType([
+    StructField("County", StringType(), False),
+    StructField("Population", IntegerType(), False),
+    ])
+population_df = spark.read.format("csv").options(header="true").schema(population_schema).load(f"{S3BUCKET}/county_population.csv")
+population_df.show(5, False)
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ### County urban/rural classification
 # MAGIC https://mn.gov/admin/demography/reports-resources/greater-mn-refined-and-revisited.jsp
 # MAGIC 
@@ -64,12 +81,12 @@ case_df.show(5, False)
 
 # COMMAND ----------
 
-county_schema = StructType([
+county_type_schema = StructType([
     StructField("County", StringType(), False),
     StructField("Type", StringType(), False),
     ])
-county_df = spark.read.format("csv").options(header="true").schema(county_schema).load(f"{S3BUCKET}/county.csv")
-county_df.show(5, False)
+county_type_df = spark.read.format("csv").options(header="true").schema(county_type_schema).load(f"{S3BUCKET}/county.csv")
+display(county_type_df.groupBy("Type").count())
 
 # COMMAND ----------
 
@@ -163,3 +180,67 @@ provider_schema = StructType([
 ])
 provider_df = spark.read.format("csv").options(header="true").schema(provider_schema).load(f"{S3BUCKET}/provider_list.csv")
 provider_df.show(5, False)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Transformations
+# MAGIC 
+# MAGIC   - join county type and population and add uppercase county name to make joins easier
+# MAGIC   - count cases by month and county
+
+# COMMAND ----------
+
+county_df = county_type_df.join(population_df, "County").withColumn("county_uc", upper(col("County")))
+case_count_by_county_df = case_df.groupBy("case_month", "res_county").count()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Analysis
+# MAGIC 
+# MAGIC   - join cases to county type
+
+# COMMAND ----------
+
+case_county_type_df = case_df.join(county_df, case_df.res_county == county_df.county_uc, "left_outer").na.fill({"Type": "Unknown"})
+cases_bymonth_bycounty_type_df = case_county_type_df.groupBy("case_month", "Type").count()
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## just trying to figure things out
+
+# COMMAND ----------
+
+display(case_count_by_county_df.filter(col("res_county") == "NA"))
+
+# COMMAND ----------
+
+case_county_type_df.tail(10)
+
+# COMMAND ----------
+
+display(county_df)
+
+# COMMAND ----------
+
+display(county_type_df.groupBy("Type").count())
+
+# COMMAND ----------
+
+display(cases_bymonth_bycounty_type_df.orderBy(col("case_month")))
+
+# COMMAND ----------
+
+df = case_county_type_df.select("case_month", "res_county", "Type")
+df.show(5, False)
+
+# COMMAND ----------
+
+maybe = df.groupBy("case_month", "res_county")
+doubtful = maybe.pivot("Type").count()
+doubtful.show(5, False)
+
+# COMMAND ----------
+
+doubtful.count()
