@@ -9,7 +9,7 @@
 # COMMAND ----------
 
 from pyspark.sql.types import *
-from pyspark.sql.functions import col, upper
+from pyspark.sql.functions import col, trim, upper
 
 S3BUCKET = "s3://seng-5709-spark"
 
@@ -22,6 +22,7 @@ S3BUCKET = "s3://seng-5709-spark"
 # MAGIC https://data.cdc.gov/Case-Surveillance/COVID-19-Case-Surveillance-Public-Use-Data-with-Ge/n8mc-b4w4
 # MAGIC 
 # MAGIC   - Using unix tools, extracted the header and rows for res_state = MN to reduce the dataset from 69 to 1.4 million rows.
+# MAGIC   - Use Spark to limit data to April 2020 through February 2022
 
 # COMMAND ----------
 
@@ -46,7 +47,8 @@ case_schema = StructType([
     StructField("death_yn", StringType(), True),
     StructField("underlying_conditions_yn", StringType(), True),
 ])
-case_df = spark.read.format("csv").options(header="true", dateFormat="YYYY-mm").schema(case_schema).load(f"{S3BUCKET}/COVID-MN.csv")
+raw_case_df = spark.read.format("csv").options(header="true", dateFormat="YYYY-mm").schema(case_schema).load(f"{S3BUCKET}/COVID-MN.csv")
+case_df = raw_case_df.where("case_month between '2020-03-31' and '2022-02-28'")
 case_df.show(5, False)
 
 # COMMAND ----------
@@ -60,8 +62,8 @@ case_df.show(5, False)
 # COMMAND ----------
 
 population_schema = StructType([
-    StructField("County", StringType(), False),
-    StructField("Population", IntegerType(), False),
+    StructField("county", StringType(), False),
+    StructField("population", IntegerType(), False),
     ])
 population_df = spark.read.format("csv").options(header="true").schema(population_schema).load(f"{S3BUCKET}/county_population.csv")
 population_df.show(5, False)
@@ -82,11 +84,12 @@ population_df.show(5, False)
 # COMMAND ----------
 
 county_type_schema = StructType([
-    StructField("County", StringType(), False),
-    StructField("Type", StringType(), False),
+    StructField("county", StringType(), False),
+    StructField("type", StringType(), False),
     ])
 county_type_df = spark.read.format("csv").options(header="true").schema(county_type_schema).load(f"{S3BUCKET}/county.csv")
-display(county_type_df.groupBy("Type").count())
+county_type_df = county_type_df.withColumn("type", trim(col("type")))
+display(county_type_df.groupBy("type").count())
 
 # COMMAND ----------
 
@@ -100,13 +103,13 @@ display(county_type_df.groupBy("Type").count())
 # COMMAND ----------
 
 profile_schema = StructType([
-    StructField("County", StringType(), False),
-    StructField("Indicator category", StringType(), False),
-    StructField("Indicator", StringType(), False),
-    StructField("Year", StringType(), True),
-    StructField("State Value", DoubleType(), False),
-    StructField("Value", DoubleType(), False),
-    StructField("Unit of measure", StringType(), False),
+    StructField("county", StringType(), False),
+    StructField("indicator_category", StringType(), False),
+    StructField("indicator", StringType(), False),
+    StructField("year", StringType(), True),
+    StructField("state_value", DoubleType(), False),
+    StructField("value", DoubleType(), False),
+    StructField("unit_of_measure", StringType(), False),
     ])
 profile_df = spark.read.format("csv").options(encoding="utf-16", header="true", sep="\t").schema(profile_schema).load(f"{S3BUCKET}/MN_county_profile.csv")
 # needs additional transformation to be useful
@@ -191,7 +194,7 @@ provider_df.show(5, False)
 
 # COMMAND ----------
 
-county_df = county_type_df.join(population_df, "County").withColumn("county_uc", upper(col("County")))
+county_df = county_type_df.join(population_df, "county").withColumn("county_uc", upper(col("county")))
 case_count_by_county_df = case_df.groupBy("case_month", "res_county").count()
 
 # COMMAND ----------
@@ -203,8 +206,8 @@ case_count_by_county_df = case_df.groupBy("case_month", "res_county").count()
 
 # COMMAND ----------
 
-case_county_type_df = case_df.join(county_df, case_df.res_county == county_df.county_uc, "left_outer").na.fill({"Type": "Unknown"})
-cases_bymonth_bycounty_type_df = case_county_type_df.groupBy("case_month", "Type").count()
+case_county_type_df = case_df.join(county_df, case_df.res_county == county_df.county_uc, "left_outer").na.fill({"type": "Unknown"})
+cases_bymonth_bycounty_type_df = case_county_type_df.groupBy("case_month", "type").count()
 
 # COMMAND ----------
 # MAGIC %md
@@ -212,7 +215,7 @@ cases_bymonth_bycounty_type_df = case_county_type_df.groupBy("case_month", "Type
 
 # COMMAND ----------
 
-display(case_count_by_county_df.filter(col("res_county") == "NA"))
+display(case_count_by_county_df.filter(col("res_county") == "NA").orderBy("case_month"))
 
 # COMMAND ----------
 
@@ -224,23 +227,41 @@ display(county_df)
 
 # COMMAND ----------
 
-display(county_type_df.groupBy("Type").count())
-
-# COMMAND ----------
-
 display(cases_bymonth_bycounty_type_df.orderBy(col("case_month")))
 
 # COMMAND ----------
 
-df = case_county_type_df.select("case_month", "res_county", "Type")
+df = case_county_type_df.select("case_month", "res_county", "type")
 df.show(5, False)
 
 # COMMAND ----------
 
 maybe = df.groupBy("case_month", "res_county")
-doubtful = maybe.pivot("Type").count()
+doubtful = maybe.pivot("type").count()
 doubtful.show(5, False)
 
 # COMMAND ----------
 
-doubtful.count()
+case_month_county_type_df = case_county_type_df.select("case_month", "res_county", "type").distinct()
+case_month_county_count_df = case_month_county_type_df.groupBy("case_month", "type").count()
+case_month_county_count_df.orderBy("case_month").show(20, False)
+
+# COMMAND ----------
+# almost all months in pandemic have cases in all urban counties (except 2-3/2020 and 6/2021)
+display(case_month_county_count_df.filter(col("type") == "Urban").orderBy("case_month"))
+
+# COMMAND ----------
+# stacked bar graph of county count per type
+display(case_month_county_count_df.orderBy("case_month"))
+
+# COMMAND ----------
+# show counties of type mix, ordered by descending population
+display(county_df.filter(col("type") == "Mix").orderBy("population", ascending=False))
+# pull out the 3 biggest counties
+huge_mix_df = case_month_county_type_df[case_month_county_type_df.res_county.isin("ST. LOUIS", "STEARNS", "WRIGHT")]
+# shows that these 3 counties are present in all months after 3/2020
+display(huge_mix_df.groupBy("case_month", "res_county").count().orderBy("case_month"))
+
+# COMMAND ----------
+# extract only the period from 2020-04-01 to 2022-02-28 (inclusive)
+case_window_df = case_df.where("case_month between '2020-03-31' and '2022-02-28'")
