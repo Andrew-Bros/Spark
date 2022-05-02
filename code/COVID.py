@@ -2,6 +2,7 @@
 # MAGIC %md
 # MAGIC # Spark Project: COVID-19 - The Urban/Rural Divide
 # MAGIC Andrew Bros
+# MAGIC 
 # MAGIC SENG-5709
 # MAGIC 
 # MAGIC ## Imports and constants
@@ -9,7 +10,7 @@
 # COMMAND ----------
 
 from pyspark.sql.types import *
-from pyspark.sql.functions import col, trim, upper
+from pyspark.sql.functions import col, lit, trim, upper
 
 S3BUCKET = "s3://seng-5709-spark"
 
@@ -182,86 +183,132 @@ provider_schema = StructType([
     StructField("ALL_CAPACITY", IntegerType(), True),
 ])
 provider_df = spark.read.format("csv").options(header="true").schema(provider_schema).load(f"{S3BUCKET}/provider_list.csv")
-provider_df.show(5, False)
+hospital_beds_df = provider_df.groupBy("COUNTY_NAME").sum("HOSP_BEDS").withColumnRenamed("COUNTY_NAME", "county_uc").withColumnRenamed("sum(HOSP_BEDS)", "hospital_beds")
+hospital_beds_df.show(5, False)
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Transformations
 # MAGIC 
+# MAGIC ### Join county information into one DataFrame
 # MAGIC   - join county type and population and add uppercase county name to make joins easier
-# MAGIC   - count cases by month and county
+# MAGIC   - join result with hospital beds to add that count for each county
 
 # COMMAND ----------
 
-county_df = county_type_df.join(population_df, "county").withColumn("county_uc", upper(col("county")))
-case_count_by_county_df = case_df.groupBy("case_month", "res_county").count()
+tmp_df = county_type_df.join(population_df, "county").withColumn("county_uc", upper(col("county")))
+county_df = tmp_df.join(hospital_beds_df, "county_uc", "left_outer").na.fill({"hospital_beds": 0})
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Join cases with county information
+# MAGIC 
+# MAGIC After joining, count the number of cases from the Rural counties.
+# MAGIC There are none because the data has been de-identified.
+
+# COMMAND ----------
+
+case_with_county_info_df = case_df.join(county_df, case_df.res_county == county_df.county_uc, "left_outer").na.fill({"type": "Unknown"})
+display(case_with_county_info_df.filter(col("type") == "Rural").count())
+
+# COMMAND ----------
+
+# count cases with no county info
+display(case_with_county_info_df[case_with_county_info_df.county.isNull()].count())
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Analysis
 # MAGIC 
-# MAGIC   - join cases to county type
 
 # COMMAND ----------
 
-case_county_type_df = case_df.join(county_df, case_df.res_county == county_df.county_uc, "left_outer").na.fill({"type": "Unknown"})
-cases_bymonth_bycounty_type_df = case_county_type_df.groupBy("case_month", "type").count()
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## just trying to figure things out
+# plot cases by month by county type
+cases_bycounty_type_df = case_with_county_info_df.groupBy("case_month", "type").count()
+display(cases_bycounty_type_df.orderBy(col("case_month")))
 
 # COMMAND ----------
 
-display(case_count_by_county_df.filter(col("res_county") == "NA").orderBy("case_month"))
+# get the number of counties by type that have cases for each month
+distinct_counties_with_cases_bymonth_df = case_with_county_info_df.select("case_month", "res_county", "type").distinct()
+county_count_with_cases_bymonth_df = distinct_counties_with_cases_bymonth_df.groupBy("case_month", "type").count()
+
+# bar graph of the count of counties with cases for each month per county type
+# almost all months in pandemic have cases in all urban counties (except 4/2020 and 6/2021)
+display(county_count_with_cases_bymonth_df.orderBy("case_month"))
 
 # COMMAND ----------
 
-case_county_type_df.tail(10)
+# Build list of 5 biggest counties in "Mix" type
+biggest_mix_counties = []
+for c in county_df.filter(col("type") == "Mix").orderBy("population", ascending=False).select("county_uc").head(5):
+    biggest_mix_counties.append(c.county_uc)
+biggest_mix_counties
 
 # COMMAND ----------
 
-display(county_df)
-
-# COMMAND ----------
-
-display(cases_bymonth_bycounty_type_df.orderBy(col("case_month")))
-
-# COMMAND ----------
-
-df = case_county_type_df.select("case_month", "res_county", "type")
-df.show(5, False)
-
-# COMMAND ----------
-
-maybe = df.groupBy("case_month", "res_county")
-doubtful = maybe.pivot("type").count()
-doubtful.show(5, False)
-
-# COMMAND ----------
-
-case_month_county_type_df = case_county_type_df.select("case_month", "res_county", "type").distinct()
-case_month_county_count_df = case_month_county_type_df.groupBy("case_month", "type").count()
-case_month_county_count_df.orderBy("case_month").show(20, False)
-
-# COMMAND ----------
-# almost all months in pandemic have cases in all urban counties (except 2-3/2020 and 6/2021)
-display(case_month_county_count_df.filter(col("type") == "Urban").orderBy("case_month"))
-
-# COMMAND ----------
-# stacked bar graph of county count per type
-display(case_month_county_count_df.orderBy("case_month"))
-
-# COMMAND ----------
-# show counties of type mix, ordered by descending population
-display(county_df.filter(col("type") == "Mix").orderBy("population", ascending=False))
-# pull out the 3 biggest counties
-huge_mix_df = case_month_county_type_df[case_month_county_type_df.res_county.isin("ST. LOUIS", "STEARNS", "WRIGHT")]
-# shows that these 3 counties are present in all months after 3/2020
+# pull out the 5 biggest Mix counties
+huge_mix_df = distinct_counties_with_cases_bymonth_df[distinct_counties_with_cases_bymonth_df.res_county.isin(biggest_mix_counties)]
+# shows that these 5 counties are present in all months (except Winona in 5/2020)
 display(huge_mix_df.groupBy("case_month", "res_county").count().orderBy("case_month"))
 
 # COMMAND ----------
-# extract only the period from 2020-04-01 to 2022-02-28 (inclusive)
-case_window_df = case_df.where("case_month between '2020-03-31' and '2022-02-28'")
+
+# drop cases from the biggest Mix counties from dataset
+filtered_case_df = case_with_county_info_df[~case_with_county_info_df.res_county.isin(biggest_mix_counties)]
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Need total population, population for urban and non-urban counties
+
+# COMMAND ----------
+
+# get total population by county type
+total_population = county_df.select("population").groupBy().sum().first()[0]
+print(f"Total Population = {total_population}")
+
+total_population_by_county_type_df = county_df.groupBy("type").sum("population").withColumnRenamed("sum(population)", "population")
+print("Population for county type")
+display(total_population_by_county_type_df)
+
+total_urban_population = total_population_by_county_type_df.filter(col("type") == "Urban").select("population").groupBy().sum().first()[0]
+print(f"Total Urban Population = {total_urban_population}")
+
+excluded_population = county_df[county_df.county_uc.isin(biggest_mix_counties)].select("population").groupBy().sum().first()[0]
+total_non_urban_population = total_population_by_county_type_df.filter(col("type") != "Urban").select("population").groupBy().sum().first()[0] - excluded_population
+print(f"Total Non-Urban Population = {total_non_urban_population} (excluded counties = {excluded_population})")
+
+assert total_population == total_urban_population + total_non_urban_population + excluded_population
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Count cases per month for Urban and Non-Urban counties
+# MAGIC 
+# MAGIC Calculate cases per 1000 county residents to make comparisons
+
+# COMMAND ----------
+
+# count cases per month per urban/non-urban
+urban_cases_per_month_df = filtered_case_df.filter(col("type") == "Urban").groupBy("case_month", "type").count()
+non_urban_cases_per_month_df = filtered_case_df.filter(col("type") != "Urban").drop("type").withColumn("type", lit("Non-Urban")).groupBy("case_month", "type").count()
+
+# COMMAND ----------
+
+# calculate cases per thousand residents
+urban_cases_per_thousand_df = urban_cases_per_month_df.withColumn("population", lit(total_urban_population)).withColumn("cases_per_1000", 1000 * col("count") / col("population"))
+non_urban_cases_per_thousand_df = non_urban_cases_per_month_df.withColumn("population", lit(total_non_urban_population)).withColumn("cases_per_1000", 1000 * col("count") / col("population"))
+
+# COMMAND ----------
+
+# concatenate urban and non-urban cases with union
+cases_per_thousand_df = urban_cases_per_thousand_df.union(non_urban_cases_per_thousand_df)
+display(cases_per_thousand_df.orderBy("case_month"))
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC   - similar analysis for hospitalizations and deaths
