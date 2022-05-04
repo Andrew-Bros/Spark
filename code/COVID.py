@@ -24,6 +24,7 @@ S3BUCKET = "s3://seng-5709-spark"
 # MAGIC 
 # MAGIC   - Using unix tools, extracted the header and rows for res_state = MN to reduce the dataset from 69 to 1.4 million rows.
 # MAGIC   - Use Spark to limit data to April 2020 through February 2022
+# MAGIC   - Normalize yes/no fields
 
 # COMMAND ----------
 
@@ -48,8 +49,15 @@ case_schema = StructType([
     StructField("death_yn", StringType(), True),
     StructField("underlying_conditions_yn", StringType(), True),
 ])
-raw_case_df = spark.read.format("csv").options(header="true", dateFormat="YYYY-mm").schema(case_schema).load(f"{S3BUCKET}/COVID-MN.csv")
-case_df = raw_case_df.where("case_month between '2020-03-31' and '2022-02-28'")
+raw_case_df = (spark.read.format("csv")
+               .options(header="true", dateFormat="YYYY-mm")
+               .schema(case_schema)
+               .load(f"{S3BUCKET}/COVID-MN.csv"))
+case_df = (raw_case_df
+           .where("case_month between '2020-03-31' and '2022-02-28'")
+           .replace(["Yes","No","NA","Missing","Unknown"],
+                    ["YES","NO","NA","NA","NA"],
+                    ["exposure_yn", "hosp_yn", "icu_yn", "death_yn", "underlying_conditions_yn"]))
 case_df.show(5, False)
 
 # COMMAND ----------
@@ -66,7 +74,10 @@ population_schema = StructType([
     StructField("county", StringType(), False),
     StructField("population", IntegerType(), False),
     ])
-population_df = spark.read.format("csv").options(header="true").schema(population_schema).load(f"{S3BUCKET}/county_population.csv")
+population_df = (spark.read.format("csv")
+                 .options(header="true")
+                 .schema(population_schema)
+                 .load(f"{S3BUCKET}/county_population.csv"))
 population_df.show(5, False)
 
 # COMMAND ----------
@@ -88,7 +99,10 @@ county_type_schema = StructType([
     StructField("county", StringType(), False),
     StructField("type", StringType(), False),
     ])
-county_type_df = spark.read.format("csv").options(header="true").schema(county_type_schema).load(f"{S3BUCKET}/county.csv")
+county_type_df = (spark.read.format("csv")
+                  .options(header="true")
+                  .schema(county_type_schema)
+                  .load(f"{S3BUCKET}/county.csv"))
 county_type_df = county_type_df.withColumn("type", trim(col("type")))
 display(county_type_df.groupBy("type").count())
 
@@ -112,7 +126,10 @@ profile_schema = StructType([
     StructField("value", DoubleType(), False),
     StructField("unit_of_measure", StringType(), False),
     ])
-profile_df = spark.read.format("csv").options(encoding="utf-16", header="true", sep="\t").schema(profile_schema).load(f"{S3BUCKET}/MN_county_profile.csv")
+profile_df = (spark.read.format("csv")
+              .options(encoding="utf-16", header="true", sep="\t")
+              .schema(profile_schema)
+              .load(f"{S3BUCKET}/MN_county_profile.csv"))
 # needs additional transformation to be useful
 profile_df.show(5, False)
 
@@ -182,8 +199,13 @@ provider_schema = StructType([
     StructField("ALL_PROV", StringType(), True),
     StructField("ALL_CAPACITY", IntegerType(), True),
 ])
-provider_df = spark.read.format("csv").options(header="true").schema(provider_schema).load(f"{S3BUCKET}/provider_list.csv")
-hospital_beds_df = provider_df.groupBy("COUNTY_NAME").sum("HOSP_BEDS").withColumnRenamed("COUNTY_NAME", "county_uc").withColumnRenamed("sum(HOSP_BEDS)", "hospital_beds")
+provider_df = (spark.read.format("csv")
+               .options(header="true")
+               .schema(provider_schema)
+               .load(f"{S3BUCKET}/provider_list.csv"))
+hospital_beds_df = (provider_df.groupBy("COUNTY_NAME").sum("HOSP_BEDS")
+                    .withColumnRenamed("COUNTY_NAME", "county_uc")
+                    .withColumnRenamed("sum(HOSP_BEDS)", "hospital_beds"))
 hospital_beds_df.show(5, False)
 
 # COMMAND ----------
@@ -197,8 +219,10 @@ hospital_beds_df.show(5, False)
 
 # COMMAND ----------
 
-tmp_df = county_type_df.join(population_df, "county").withColumn("county_uc", upper(col("county")))
-county_df = tmp_df.join(hospital_beds_df, "county_uc", "left_outer").na.fill({"hospital_beds": 0})
+tmp_df = (county_type_df.join(population_df, "county")
+          .withColumn("county_uc", upper(col("county"))))
+county_df = (tmp_df.join(hospital_beds_df, "county_uc", "left_outer")
+             .na.fill({"hospital_beds": 0}))
 
 # COMMAND ----------
 
@@ -210,7 +234,8 @@ county_df = tmp_df.join(hospital_beds_df, "county_uc", "left_outer").na.fill({"h
 
 # COMMAND ----------
 
-case_with_county_info_df = case_df.join(county_df, case_df.res_county == county_df.county_uc, "left_outer").na.fill({"type": "Unknown"})
+case_with_county_info_df = (case_df.join(county_df, case_df.res_county == county_df.county_uc, "left_outer")
+                            .na.fill({"type": "Unknown"}))
 display(case_with_county_info_df.filter(col("type") == "Rural").count())
 
 # COMMAND ----------
@@ -222,7 +247,6 @@ display(case_with_county_info_df[case_with_county_info_df.county.isNull()].count
 
 # MAGIC %md
 # MAGIC ## Analysis
-# MAGIC 
 
 # COMMAND ----------
 
@@ -236,8 +260,9 @@ display(cases_bycounty_type_df.orderBy(col("case_month")))
 distinct_counties_with_cases_bymonth_df = case_with_county_info_df.select("case_month", "res_county", "type").distinct()
 county_count_with_cases_bymonth_df = distinct_counties_with_cases_bymonth_df.groupBy("case_month", "type").count()
 
-# bar graph of the count of counties with cases for each month per county type
-# almost all months in pandemic have cases in all urban counties (except 4/2020 and 6/2021)
+# COMMAND ----------
+
+# stacked bar graph of county count per type
 display(county_count_with_cases_bymonth_df.orderBy("case_month"))
 
 # COMMAND ----------
@@ -259,6 +284,12 @@ display(huge_mix_df.groupBy("case_month", "res_county").count().orderBy("case_mo
 
 # drop cases from the biggest Mix counties from dataset
 filtered_case_df = case_with_county_info_df[~case_with_county_info_df.res_county.isin(biggest_mix_counties)]
+
+# and split into urban cases and non-urban cases
+urban_case_df = filtered_case_df.filter(col("type") == "Urban")
+non_urban_case_df = (filtered_case_df.filter(col("type") != "Urban")
+                     .drop("type")
+                     .withColumn("type", lit("Non-Urban")))
 
 # COMMAND ----------
 
@@ -294,14 +325,18 @@ assert total_population == total_urban_population + total_non_urban_population +
 # COMMAND ----------
 
 # count cases per month per urban/non-urban
-urban_cases_per_month_df = filtered_case_df.filter(col("type") == "Urban").groupBy("case_month", "type").count()
-non_urban_cases_per_month_df = filtered_case_df.filter(col("type") != "Urban").drop("type").withColumn("type", lit("Non-Urban")).groupBy("case_month", "type").count()
+urban_cases_per_month_df = urban_case_df.groupBy("case_month", "type").count()
+non_urban_cases_per_month_df = non_urban_case_df.groupBy("case_month", "type").count()
 
 # COMMAND ----------
 
 # calculate cases per thousand residents
-urban_cases_per_thousand_df = urban_cases_per_month_df.withColumn("population", lit(total_urban_population)).withColumn("cases_per_1000", 1000 * col("count") / col("population"))
-non_urban_cases_per_thousand_df = non_urban_cases_per_month_df.withColumn("population", lit(total_non_urban_population)).withColumn("cases_per_1000", 1000 * col("count") / col("population"))
+urban_cases_per_thousand_df = (urban_cases_per_month_df
+                               .withColumn("population", lit(total_urban_population))
+                               .withColumn("cases_per_1000", 1000 * col("count") / col("population")))
+non_urban_cases_per_thousand_df = (non_urban_cases_per_month_df
+                                   .withColumn("population", lit(total_non_urban_population))
+                                   .withColumn("cases_per_1000", 1000 * col("count") / col("population")))
 
 # COMMAND ----------
 
@@ -310,5 +345,46 @@ cases_per_thousand_df = urban_cases_per_thousand_df.union(non_urban_cases_per_th
 display(cases_per_thousand_df.orderBy("case_month"))
 
 # COMMAND ----------
+
 # MAGIC %md
-# MAGIC   - similar analysis for hospitalizations and deaths
+# MAGIC Calculate hospitalization percentage by Urban/Non-Urban counties
+
+# COMMAND ----------
+
+urban_hosp_case_df = urban_case_df.groupBy("case_month", "type").pivot("hosp_yn").count()
+urban_hosp_percent_df = (urban_hosp_case_df
+                         .withColumn("hosp_pct", 100 * col("YES") / (col("YES") + col("NO"))))
+
+non_urban_hosp_case_df =  non_urban_case_df.groupBy("case_month", "type").pivot("hosp_yn").count()
+non_urban_hosp_percent_df = (non_urban_hosp_case_df
+                             .withColumn("hosp_pct", 100 * col("YES") / (col("YES") + col("NO"))))
+
+cases_hosp_percent_df = urban_hosp_percent_df.union(non_urban_hosp_percent_df)
+
+# COMMAND ----------
+
+# take a look at the result
+display(cases_hosp_percent_df.orderBy("case_month"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Calculate mortality percentage by Urban/Non-Urban counties
+
+# COMMAND ----------
+
+urban_death_case_df = urban_case_df.groupBy("case_month", "type").pivot("death_yn").count()
+urban_death_percent_df = (urban_death_case_df
+                          .withColumn("death_pct", 100 * col("YES") / (col("YES") + col("NO"))))
+
+non_urban_death_case_df =  non_urban_case_df.groupBy("case_month", "type").pivot("death_yn").count()
+non_urban_death_percent_df = (non_urban_death_case_df
+                              .withColumn("death_pct", 100 * col("YES") / (col("YES") + col("NO"))))
+
+cases_death_percent_df = urban_death_percent_df.union(non_urban_death_percent_df)
+
+# COMMAND ----------
+
+# take a look at the result
+display(cases_death_percent_df.orderBy("case_month"))
+
