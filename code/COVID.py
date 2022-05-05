@@ -10,7 +10,7 @@
 # COMMAND ----------
 
 from pyspark.sql.types import *
-from pyspark.sql.functions import col, lit, trim, upper
+from pyspark.sql.functions import col, lit, trim, upper, when
 
 S3BUCKET = "s3://seng-5709-spark"
 
@@ -24,7 +24,7 @@ S3BUCKET = "s3://seng-5709-spark"
 # MAGIC 
 # MAGIC   - Using unix tools, extracted the header and rows for res_state = MN to reduce the dataset from 69 to 1.4 million rows.
 # MAGIC   - Use Spark to limit data to April 2020 through February 2022
-# MAGIC   - Normalize yes/no fields
+# MAGIC   - Normalize hosp_yn and death_yn fields
 
 # COMMAND ----------
 
@@ -55,9 +55,12 @@ raw_case_df = (spark.read.format("csv")
                .load(f"{S3BUCKET}/COVID-MN.csv"))
 case_df = (raw_case_df
            .where("case_month between '2020-03-31' and '2022-02-28'")
-           .replace(["Yes","No","NA","Missing","Unknown"],
-                    ["YES","NO","NA","NA","NA"],
-                    ["exposure_yn", "hosp_yn", "icu_yn", "death_yn", "underlying_conditions_yn"]))
+           .withColumn("hosp_yn", when(upper(col("hosp_yn")) == "YES", "YES")
+                       .when(upper(col("hosp_yn")) == "NO", "NO")
+                       .otherwise("NA"))
+           .withColumn("death_yn", when(upper(col("death_yn")) == "YES", "YES")
+                       .when(upper(col("death_yn")) == "NO", "NO")
+                       .otherwise("NA")))
 case_df.show(5, False)
 
 # COMMAND ----------
@@ -114,6 +117,7 @@ display(county_type_df.groupBy("type").count())
 # MAGIC 
 # MAGIC   - took a while to figure out that this file is utf-16 encoded
 # MAGIC   - symptom was that State Value and Value could not be converted to double
+# MAGIC   - extract median income and uninsured rate
 
 # COMMAND ----------
 
@@ -126,12 +130,20 @@ profile_schema = StructType([
     StructField("value", DoubleType(), False),
     StructField("unit_of_measure", StringType(), False),
     ])
-profile_df = (spark.read.format("csv")
+raw_profile_df = (spark.read.format("csv")
               .options(encoding="utf-16", header="true", sep="\t")
               .schema(profile_schema)
               .load(f"{S3BUCKET}/MN_county_profile.csv"))
-# needs additional transformation to be useful
-profile_df.show(5, False)
+profile_df = (raw_profile_df.withColumn("county_uc", upper(col("county")))
+              .select("county_uc", "indicator", "value"))
+median_income_df = (profile_df.filter(col("indicator") == "Median household income")
+                    .withColumnRenamed("value", "median_income")
+                    .drop("indicator"))
+uninsured_df = (profile_df.filter(col("indicator") == "Adults without health insurance")
+                .withColumnRenamed("value", "uninsured")
+                .drop("indicator"))
+county_financial_df = median_income_df.join(uninsured_df, "county_uc")
+county_financial_df.show(5, False)
 
 # COMMAND ----------
 
@@ -140,6 +152,7 @@ profile_df.show(5, False)
 # MAGIC https://mdhprovidercontent.web.health.state.mn.us/showprovideroutput.cfm
 # MAGIC 
 # MAGIC   - download of xls, saved as csv
+# MAGIC   - normalize two county names
 
 # COMMAND ----------
 
@@ -199,10 +212,14 @@ provider_schema = StructType([
     StructField("ALL_PROV", StringType(), True),
     StructField("ALL_CAPACITY", IntegerType(), True),
 ])
-provider_df = (spark.read.format("csv")
+raw_provider_df = (spark.read.format("csv")
                .options(header="true")
                .schema(provider_schema)
                .load(f"{S3BUCKET}/provider_list.csv"))
+provider_df = (raw_provider_df
+               .withColumn("COUNTY_NAME", when(col("COUNTY_NAME") == "LESUEUR", "LE SUEUR")
+                           .when(col("COUNTY_NAME") == "SAINT LOUIS", "ST. LOUIS")
+                           .otherwise(col("COUNTY_NAME"))))
 hospital_beds_df = (provider_df.groupBy("COUNTY_NAME").sum("HOSP_BEDS")
                     .withColumnRenamed("COUNTY_NAME", "county_uc")
                     .withColumnRenamed("sum(HOSP_BEDS)", "hospital_beds"))
@@ -216,13 +233,15 @@ hospital_beds_df.show(5, False)
 # MAGIC ### Join county information into one DataFrame
 # MAGIC   - join county type and population and add uppercase county name to make joins easier
 # MAGIC   - join result with hospital beds to add that count for each county
+# MAGIC   - join with financial information for median income and uninsured rate
 
 # COMMAND ----------
 
 tmp_df = (county_type_df.join(population_df, "county")
           .withColumn("county_uc", upper(col("county"))))
-county_df = (tmp_df.join(hospital_beds_df, "county_uc", "left_outer")
-             .na.fill({"hospital_beds": 0}))
+tmp2_df = (tmp_df.join(hospital_beds_df, "county_uc", "left_outer")
+           .na.fill({"hospital_beds": 0}))
+county_df = tmp2_df.join(county_financial_df, "county_uc")
 
 # COMMAND ----------
 
@@ -388,3 +407,37 @@ cases_death_percent_df = urban_death_percent_df.union(non_urban_death_percent_df
 # take a look at the result
 display(cases_death_percent_df.orderBy("case_month"))
 
+# from published data on https://www.health.state.mn.us/diseases/coronavirus/situation.html#death1
+# cumulative deaths as of 2/28/2022 was 12,288 so we're only able to classify about 45%
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Get county info population, hospital bed totals by urban/non-urban
+# MAGIC  - TODO: sum population, beds but average median income and uninsured rate
+
+# COMMAND ----------
+
+county_by_type_df = county_df[~county_df.county_uc.isin(biggest_mix_counties)].withColumn("type", when(col("type") == "Urban", "Urban").otherwise("Non-Urban"))
+county_by_type_info_df = county_by_type_df.groupBy("type").sum().withColumnRenamed("sum(population)", "population").withColumnRenamed("sum(hospital_beds)", "hospital_beds")
+display(county_by_type_info_df)
+
+# COMMAND ----------
+
+hosp_beds_used_df = (cases_hosp_percent_df
+                     .join(county_by_type_info_df, cases_hosp_percent_df.type == county_by_type_info_df.type)
+                     .withColumn("beds_used_pct", 100 * col("YES") / col("hospital_beds")))
+display(hosp_beds_used_df.orderBy("case_month"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC - Look into the relationship between median income and uninsured rate
+# MAGIC - uninsured rate vs hospitalization?
+# MAGIC - median income vs deaths?
+# MAGIC - what else?
+
+# COMMAND ----------
+
+# scatter plot of median income vs uninsured rate
+display(county_df)
