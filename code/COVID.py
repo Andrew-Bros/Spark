@@ -149,7 +149,7 @@ county_financial_df.show(5, False)
 
 # MAGIC %md
 # MAGIC ### MN Department of Health provider list
-# MAGIC https://mdhprovidercontent.web.health.state.mn.us/showprovideroutput.cfm
+# MAGIC https://mdhprovidercontent.web.health.state.mn.us/facilityDirectoryExtract.cfm
 # MAGIC 
 # MAGIC   - download of xls, saved as csv
 # MAGIC   - normalize two county names
