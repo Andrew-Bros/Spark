@@ -13,6 +13,8 @@ from pyspark.sql.types import *
 from pyspark.sql.functions import col, lit, trim, upper, when
 
 S3BUCKET = "s3://seng-5709-spark"
+# set VERBOSE = True to show snippets of dataframes as they are created
+VERBOSE = False
 
 # COMMAND ----------
 
@@ -61,7 +63,8 @@ case_df = (raw_case_df
            .withColumn("death_yn", when(upper(col("death_yn")) == "YES", "YES")
                        .when(upper(col("death_yn")) == "NO", "NO")
                        .otherwise("NA")))
-case_df.show(5, False)
+if VERBOSE:
+    case_df.show(5, False)
 
 # COMMAND ----------
 
@@ -76,12 +79,13 @@ case_df.show(5, False)
 population_schema = StructType([
     StructField("county", StringType(), False),
     StructField("population", IntegerType(), False),
-    ])
+])
 population_df = (spark.read.format("csv")
                  .options(header="true")
                  .schema(population_schema)
                  .load(f"{S3BUCKET}/county_population.csv"))
-population_df.show(5, False)
+if VERBOSE:
+    population_df.show(5, False)
 
 # COMMAND ----------
 
@@ -101,7 +105,7 @@ population_df.show(5, False)
 county_type_schema = StructType([
     StructField("county", StringType(), False),
     StructField("type", StringType(), False),
-    ])
+])
 county_type_df = (spark.read.format("csv")
                   .options(header="true")
                   .schema(county_type_schema)
@@ -129,7 +133,7 @@ profile_schema = StructType([
     StructField("state_value", DoubleType(), False),
     StructField("value", DoubleType(), False),
     StructField("unit_of_measure", StringType(), False),
-    ])
+])
 raw_profile_df = (spark.read.format("csv")
               .options(encoding="utf-16", header="true", sep="\t")
               .schema(profile_schema)
@@ -143,7 +147,8 @@ uninsured_df = (profile_df.filter(col("indicator") == "Adults without health ins
                 .withColumnRenamed("value", "uninsured")
                 .drop("indicator"))
 county_financial_df = median_income_df.join(uninsured_df, "county_uc")
-county_financial_df.show(5, False)
+if VERBOSE:
+    county_financial_df.show(5, False)
 
 # COMMAND ----------
 
@@ -223,7 +228,8 @@ provider_df = (raw_provider_df
 hospital_beds_df = (provider_df.groupBy("COUNTY_NAME").sum("HOSP_BEDS")
                     .withColumnRenamed("COUNTY_NAME", "county_uc")
                     .withColumnRenamed("sum(HOSP_BEDS)", "hospital_beds"))
-hospital_beds_df.show(5, False)
+if VERBOSE:
+    hospital_beds_df.show(5, False)
 
 # COMMAND ----------
 
@@ -242,36 +248,56 @@ tmp_df = (county_type_df.join(population_df, "county")
 tmp2_df = (tmp_df.join(hospital_beds_df, "county_uc", "left_outer")
            .na.fill({"hospital_beds": 0}))
 county_df = tmp2_df.join(county_financial_df, "county_uc")
+if VERBOSE:
+    county_df.show(5, False)
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ### Join cases with county information
 # MAGIC 
-# MAGIC After joining, count the number of cases from the Rural counties.
-# MAGIC There are none because the data has been de-identified.
+# MAGIC   - res_county not in county are assigned "Unknown"
 
 # COMMAND ----------
 
 case_with_county_info_df = (case_df.join(county_df, case_df.res_county == county_df.county_uc, "left_outer")
                             .na.fill({"type": "Unknown"}))
-display(case_with_county_info_df.filter(col("type") == "Rural").count())
-
-# COMMAND ----------
-
-# count cases with no county info
-display(case_with_county_info_df[case_with_county_info_df.county.isNull()].count())
+if VERBOSE:
+    case_with_county_info_df.show(5, False)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Analysis
+# MAGIC ### Work around de-identification problem
+# MAGIC 
+# MAGIC After joining, count the number of cases from the Rural counties.
+# MAGIC There are none because the data has been de-identified.
 
 # COMMAND ----------
 
-# plot cases by month by county type
+# cases for rural counties
+rural_county_case_count = case_with_county_info_df.filter(col("type") == "Rural").count()
+print(f"Total cases from rural counties = {rural_county_case_count}")
+# count cases with no county info
+no_county_case_count = case_with_county_info_df[case_with_county_info_df.county.isNull()].count()
+print(f"Total cases from unspecified counties = {no_county_case_count}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Start with looking at the number of cases by county type per month
+
+# COMMAND ----------
+
 cases_bycounty_type_df = case_with_county_info_df.groupBy("case_month", "type").count()
+# line chart (keys: case_month, grouping: type, values: count)
 display(cases_bycounty_type_df.orderBy(col("case_month")))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC See which county types have been subjected to de-identification by counting
+# MAGIC counties that have cases reported in each month
 
 # COMMAND ----------
 
@@ -279,10 +305,13 @@ display(cases_bycounty_type_df.orderBy(col("case_month")))
 distinct_counties_with_cases_bymonth_df = case_with_county_info_df.select("case_month", "res_county", "type").distinct()
 county_count_with_cases_bymonth_df = distinct_counties_with_cases_bymonth_df.groupBy("case_month", "type").count()
 
-# COMMAND ----------
-
 # stacked bar graph of county count per type
 display(county_count_with_cases_bymonth_df.orderBy("case_month"))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Get list of 5 largest Mix counties
 
 # COMMAND ----------
 
@@ -290,7 +319,7 @@ display(county_count_with_cases_bymonth_df.orderBy("case_month"))
 biggest_mix_counties = []
 for c in county_df.filter(col("type") == "Mix").orderBy("population", ascending=False).select("county_uc").head(5):
     biggest_mix_counties.append(c.county_uc)
-biggest_mix_counties
+print(f"Largest Mix counties that will be excluded: {biggest_mix_counties}")
 
 # COMMAND ----------
 
@@ -301,19 +330,36 @@ display(huge_mix_df.groupBy("case_month", "res_county").count().orderBy("case_mo
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC Filter out the biggest Mix counties from the cases
+# MAGIC and separate into urban_case_df and non_urban_case_df
+
+# COMMAND ----------
+
 # drop cases from the biggest Mix counties from dataset
 filtered_case_df = case_with_county_info_df[~case_with_county_info_df.res_county.isin(biggest_mix_counties)]
 
 # and split into urban cases and non-urban cases
 urban_case_df = filtered_case_df.filter(col("type") == "Urban")
 non_urban_case_df = (filtered_case_df.filter(col("type") != "Urban")
-                     .drop("type")
-                     .withColumn("type", lit("Non-Urban")))
+                     .withColumn("type", when(col("type") != "Urban", "Non-Urban")))
+
+# COMMAND ----------
+
+# put them back together and show the case counts by Urban/Rural
+cases_by_region_df = urban_case_df.union(non_urban_case_df).groupBy("case_month", "type").count()
+# line chart (keys: case_month, grouping: type, values: count)
+display(cases_by_region_df.orderBy(col("case_month")))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Need total population, population for urban and non-urban counties
+# MAGIC ## Analysis
+# MAGIC 
+# MAGIC ### Examine cases by county type scaled by population
+# MAGIC   - For this, we need the population of urban and non-urban counties
+# MAGIC   - get these values as simple scalars
+# MAGIC   - code includes validation that population counts are consistent
 
 # COMMAND ----------
 
@@ -332,6 +378,7 @@ excluded_population = county_df[county_df.county_uc.isin(biggest_mix_counties)].
 total_non_urban_population = total_population_by_county_type_df.filter(col("type") != "Urban").select("population").groupBy().sum().first()[0] - excluded_population
 print(f"Total Non-Urban Population = {total_non_urban_population} (excluded counties = {excluded_population})")
 
+# validate derived population counts are consistent
 assert total_population == total_urban_population + total_non_urban_population + excluded_population
 
 # COMMAND ----------
@@ -366,7 +413,7 @@ display(cases_per_thousand_df.orderBy("case_month"))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Calculate hospitalization percentage by Urban/Non-Urban counties
+# MAGIC ### Calculate percentage of cases requiring hospitalization by Urban/Non-Urban counties
 
 # COMMAND ----------
 
@@ -388,7 +435,7 @@ display(cases_hosp_percent_df.orderBy("case_month"))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC Calculate mortality percentage by Urban/Non-Urban counties
+# MAGIC ### Calculate mortality percentage by Urban/Non-Urban counties
 
 # COMMAND ----------
 
@@ -407,12 +454,32 @@ cases_death_percent_df = urban_death_percent_df.union(non_urban_death_percent_df
 # take a look at the result
 display(cases_death_percent_df.orderBy("case_month"))
 
-# from published data on https://www.health.state.mn.us/diseases/coronavirus/situation.html#death1
-# cumulative deaths as of 2/28/2022 was 12,288 so we're only able to classify about 45%
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC From published data on
+# MAGIC https://www.health.state.mn.us/diseases/coronavirus/situation.html#death1
+# MAGIC cumulative deaths as of 2/28/2022 was 12,288 so we're only able to classify
+# MAGIC about 45% of the deaths by urban/non-urban
+# MAGIC
+# MAGIC - As a follow up, look at the number of fatalities reported in the full CDC dataset
+# MAGIC - Also for the urban and non-urban partitioned datasets
+
+# COMMAND ----------
+
+total_deaths = case_df.filter(col("death_yn") == "YES").count()
+urban_deaths = urban_case_df.filter(col("death_yn") == "YES").count()
+non_urban_deaths = non_urban_case_df.filter(col("death_yn") == "YES").count()
+
+print(f"Total deaths = {total_deaths}")
+print(f"Urban deaths = {urban_deaths}")
+print(f"Non-urban deaths = {non_urban_deaths}")
 
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ### Examine the availability of hospital beds by region
+# MAGIC
 # MAGIC Get county info population, hospital bed totals by urban/non-urban
 # MAGIC  - TODO: sum population, beds but average median income and uninsured rate
 
